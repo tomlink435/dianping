@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import com.hmdp.config.RedissonConfig;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.entity.VoucherOrder;
@@ -9,6 +10,8 @@ import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,6 +34,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedisIdWorker redisIdWorker;
 
+    @Resource
+    private RedissonClient redissonClient;
+
+
     @Override
     @Transactional
     public Result seckillVoucher(Long voucherId) {
@@ -50,17 +57,29 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         Long userId = UserHolder.getUser().getId();
 //        将 userId.toString().intern() 作为锁对象。这意味着，只有持有相同 userId 的线程才能进入同步块，其它持有不同 userId 的线程可以并行执行。
-        synchronized (userId.toString().intern()){
+        RLock lock = redissonClient.getLock("order:" + userId);
+        boolean isLocked = lock.tryLock();
+        if(!isLocked){
+//            获取锁失败
+            return Result.fail("不允许重复下单");
+        }
+
+        try {
             IVoucherOrderService iVoucherOrderService = (IVoucherOrderService) AopContext.currentProxy();
             return iVoucherOrderService.createOrder(voucherId);
+        } catch (IllegalStateException e) {
+            throw new RuntimeException(e);
+        } finally {
+            lock.unlock();
         }
+
     }
 
     @Transactional
     public Result createOrder(Long voucherId) {
         //        一人一单
         Integer count = query().eq("user_id", UserHolder.getUser().getId()).eq("voucher_id", voucherId).count();
-        if(count!=0){
+        if (count != 0) {
             return Result.fail("已下过单了");
         }
 //        扣减秒杀券，
@@ -68,7 +87,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 .eq("voucher_id", voucherId)
                 .gt("stock", 0)
                 .update();
-        if(!update){
+        if (!update) {
             return Result.fail("库存不足");
         }
 //        秒杀创建订单
@@ -78,8 +97,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         long orderId = redisIdWorker.nextId("order");
         voucherOrder.setId(orderId);
         save(voucherOrder);
-//            voucherOrder.setCreateTime(LocalDateTime.now());
-//            voucherOrder.setUpdateTime(LocalDateTime.now());
+
         return Result.ok(orderId);
     }
 
